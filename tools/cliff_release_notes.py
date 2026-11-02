@@ -16,6 +16,17 @@ Steam must be running. The launcher installs the matching mod and starts the wor
 server and game. Select **Freeroam > BeamNG.Earth**. Restart both the server and game
 when replacing an older testing build, and keep the simulation unpaused while tiles load.
 
+### Changes in this build
+
+- Fix oversized cliff triangles stretching across roads by splitting dense meshes
+  within the renderer's vertex limit, preserving the complete cliff surface.
+- Add detailed arid road-cut materials selected by desert/steppe climate, with
+  matching geometry relief and regional terrain color. Other climates retain
+  the limestone road-cut material.
+- Soften arid normal shading, restore restrained red-brown mineral color, and
+  balance natural cliff brightness and fine grain against nearby cuts and terrain.
+- Add regression coverage for dense mesh splitting and mixed material families.
+
 ### What to test
 
 - Terrain-fitted natural cliffs and road cuts, with different materials and regional colors.
@@ -25,7 +36,8 @@ when replacing an older testing build, and keep the simulation unpaused while ti
   toggles in the existing BeamNG.Earth settings UI. No environment variable is required.
 
 See the [testing guide](https://github.com/Austint30/BeamNG.Earth/blob/{commit}/docs/CLIFF_TESTING.md)
-for California and Austin locations, performance comparisons, and regression scenarios.
+for California, Austin, and El Paso locations, performance comparisons, and regression scenarios.
+El Paso reference: **31.87810, -106.49561**, Woodrow Bean Transmountain Drive / TX-375.
 The cliff regression suite and packaged-server smoke tests run before publication.
 
 Please [report issues in this fork](https://github.com/Austint30/BeamNG.Earth/issues)
