@@ -50,7 +50,9 @@ jobs:
       - name: Cliff regression tests
         env:
           BNGE_ROADGEO_REAL: "0"
-        run: python -m unittest server.tests.test_cliffcuts server.tests.test_cliffrocks server.tests.test_cliffdecals server.tests.test_clifftalus server.tests.test_cdae server.tests.test_roadgeo
+        run: |
+          python -m pip install opencv-python-headless
+          PYTHONPATH=server:server/tests python -m unittest server.tests.test_cliffcuts server.tests.test_cliffrocks server.tests.test_cliffdecals server.tests.test_clifftalus server.tests.test_cdae server.tests.test_roadgeo server.tests.test_clifflod server.tests.test_cliffdetail server.tests.test_canyon_pbr server.tests.test_farcliffs server.tests.test_far_photo_shadows server.tests.test_graphics server.tests.test_matslots server.tests.test_protocol_agreement
       - name: appimagetool
         run: |
           curl -sSLo appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage

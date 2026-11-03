@@ -18,22 +18,33 @@ when replacing an older testing build, and keep the simulation unpaused while ti
 
 ### Changes in this build
 
-- Fix oversized cliff triangles stretching across roads by splitting dense meshes
-  within the renderer's vertex limit, preserving the complete cliff surface.
-- Add detailed arid road-cut materials selected by desert/steppe climate, with
-  matching geometry relief and regional terrain color. Other climates retain
-  the limestone road-cut material.
-- Soften arid normal shading, restore restrained red-brown mineral color, and
-  balance natural cliff brightness and fine grain against nearby cuts and terrain.
-- Add regression coverage for dense mesh splitting and mixed material families.
+- Extend natural cliff materials across distant terrain, with a layered canyon
+  variant for the Colorado Plateau and satellite-derived color and distant shading.
+- Add the **Distant cliff faces** toggle and unified **Cliff detail** quality
+  presets. Detail changes use safe load-time LOD selection.
+- Add the approved 4K canyon diffuse with aligned near-cliff normal, roughness,
+  and subtle ambient-occlusion maps; retain broader normals on distant cliffs
+  and reduce their horizontal scale on the extreme-distance tier.
+- Improve tall near-cliff geometry by refining vertical samples before applying
+  scanned relief, preventing folded columns, and protecting terrain clearance
+  through LOD simplification. Preserve road-cut fitting in mixed tiles.
+- Retain the terrain-matched arid/limestone materials and dense-mesh vertex-limit
+  fixes from the previous cliff testing release.
+
+The 4K maps use the approved generated source, resampled to 4096 square; PBR
+channels are inferred from the diffuse. Broad grooves from the source terrain
+can remain visible. Canyon coverage, transitions and performance need testing.
 
 ### What to test
 
+- Grand Canyon coverage from a high viewpoint: **36.05725, -112.14650**. Compare
+  near cliffs, distant faces and the horizon under different sun angles.
 - Terrain-fitted natural cliffs and road cuts, with different materials and regional colors.
 - Scattered cliff rocks, terrain transition decals, and near-vehicle cliff collision.
 - Urban highway cuts backed by original terrain, including rounded bases and crests.
-- Separate **Cliff faces**, **Scattered cliff rocks**, and **Cliff transition decals**
-  toggles in the existing BeamNG.Earth settings UI. No environment variable is required.
+- **Cliff detail** presets and separate **Cliff faces**, **Distant cliff faces**,
+  **Scattered cliff rocks**, and **Cliff transition decals** settings. Reload the
+  level after changing distant faces for a consistent view across loaded tiles.
 
 See the [testing guide](https://github.com/Austint30/BeamNG.Earth/blob/{commit}/docs/CLIFF_TESTING.md)
 for California, Austin, and El Paso locations, performance comparisons, and regression scenarios.
