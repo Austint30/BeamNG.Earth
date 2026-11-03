@@ -84,6 +84,7 @@ from PIL import Image  # noqa: E402
 import blockworker  # noqa: E402
 import cache as cachemod  # noqa: E402
 import cdae  # noqa: E402
+import clifflod  # noqa: E402
 import colormatch as colormatchmod  # noqa: E402
 import credits as creditsmod  # noqa: E402
 import covermap as covermapmod  # noqa: E402
@@ -2775,7 +2776,8 @@ class Server:
         engine's .cdae cache of it (DAE tiles)."""
         stem = os.path.splitext(name)[0]
         out = [os.path.join(self.out_dir, name), os.path.join(self.out_dir, stem + ".dds"),
-               os.path.join(self.out_dir, stem + "_road.dds")]
+               os.path.join(self.out_dir, stem + "_road.dds"),
+               os.path.join(self.out_dir, stem + "_plain.cdae")]
         out += [os.path.join(self.out_dir, f"{stem}_r{r}.dds") for r in range(1, rev + 1)]
         if texture is not None and os.path.join(self.out_dir, texture) not in out:
             out.append(os.path.join(self.out_dir, texture))
@@ -2909,11 +2911,27 @@ class Server:
         return anchor.frame, x0, y0, node.size
 
     def render_tile(self, anchor, tile, px, pending):
-        """(rgb, used): a far tile's photo with its gutter (a global tile's: its Mercator square, render_merc)."""
-        if isinstance(tile, farfield.GTile):
-            return self.imagery.render_merc(tile.z, tile.x, tile.y, px, pending=pending)
-        frame, x0, y0, size = self.tile_where(anchor, tile)
-        return self.imagery.render(frame, *imagerymod.gutter_square(x0, y0, size, px), px, pending=pending)
+        """Photo plus gutter; smoothly retain baked photo shading in distant LODs."""
+        def render(im):
+            if isinstance(tile, farfield.GTile):
+                return im.render_merc(tile.z, tile.x, tile.y, px, pending=pending)
+            frame, x0, y0, size = self.tile_where(anchor, tile)
+            return im.render(frame, *imagerymod.gutter_square(x0, y0, size, px), px, pending=pending)
+
+        amount = farfield.photo_shadow_mix(tile.level)
+        if amount == 0 or getattr(self.imagery, 'deshadow', None) is None:
+            return render(self.imagery)
+        shaded, used = render(self.imagery.with_shadows())
+        if amount == 1:
+            return shaded, used
+        close, close_used = render(self.imagery)
+        # Linear-light interpolation avoids a dark seam through the transition.
+        import cliffcolors
+        mixed = ((1-amount)*cliffcolors.linear(close/255) + amount*cliffcolors.linear(shaded/255))
+        rgb = cliffcolors.srgb(mixed)
+        counts = {k: int(round(amount*used.get(k,0)+(1-amount)*close_used.get(k,0)))
+                  for k in used.keys() | close_used.keys()}
+        return np.rint(np.clip(rgb,0,1)*255).astype(np.uint8), counts
 
     def make_tile(self, anchor, tile, prev=None):
         urgencymod.wait_turn()          # (a block the game waits for first: urgency.py)
@@ -3061,7 +3079,11 @@ class Server:
             built = farfield.clip_built(built, tile.quad)
         t2 = time.perf_counter()
         size = farfield.write_built(path, built, self.far_format, material or farfield.MATERIAL,
-                                    textured=material is not None, tex_px=self.tex_size(lvl))
+                                    textured=material is not None, tex_px=self.tex_size(lvl),
+                                    cliff_frame=self.tile_where(anchor, tile)[0] if lvl > 0 else None,
+                                    cliff_surface=self.surface,
+                                    cliff_texture=os.path.join(self.out_dir, texture) if material else None,
+                                    plain_path=os.path.splitext(path)[0] + "_plain.cdae")
         dt = time.perf_counter() - t0
         self.build_stats.append(dt)
         tex_s = t2 - t1 - geo_wait
@@ -3090,13 +3112,13 @@ class Server:
         im = self.imagery
         if isinstance(tile, farfield.GTile):
             return revisitmod.key("fartex", "m", farfield.GLOBAL_GEO_VERSION, tile.key, px, [s.name for s in im.chain],
-                                  self.tone, im.leaf_on, im.season_mode, self.tex_modes, self.layout.cells,
+                                  self.tone, im.leaf_on, im.season_mode, self.tex_modes, farfield.photo_shadow_mix(tile.level), self.layout.cells,
                                   farfield.global_dem_zoom(tile.z, self.layout.cells))
         if isinstance(tile, farfield.Piece):
             tile = tile.base
         return revisitmod.key("fartex", round(float(anchor.lat), 7), round(float(anchor.lon), 7), tile.key, px,
                               self.road_mask_px(tile.level) if self.road_masks else 0, [s.name for s in im.chain],
-                              self.tone, im.leaf_on, im.season_mode, self.tex_modes, roadsmod.ROADS_IN_GROUND,
+                              self.tone, im.leaf_on, im.season_mode, self.tex_modes, farfield.photo_shadow_mix(tile.level), roadsmod.ROADS_IN_GROUND,
                               self.mapdata.versions() if self.mapdata is not None else None,
                               self.road_widths is not None, self.surface is not None, self.layout.cells,
                               anchor.zooms[max(tile.level, 0)])
@@ -3313,7 +3335,8 @@ class Server:
 
     def pool_shapes(self, conn, files):
         """Event loop: the road / building tile's shape files ({what: file name in the session folder}) as pooled ones
-        (matslots.py; the far tiles' slots): each a hard link at a slot path, held by conn until the mod reports it
+        (matslots.py; the far tiles' slots): each a hard link (quality-adjusted copy for cliffs) at a slot path,
+        held by conn until the mod reports it
         gone (pose.slotsGone). Returns {what: [vfs path, serial]} for the message's `slots` (files that do not exist
         are left out; a slot that cannot be placed too: the mod then loads the tile's own file)."""
         out = {}
@@ -3327,8 +3350,14 @@ class Server:
             name = self.matslots.take(owner)
             slot = matslotsmod.MatSlots.file(name)
             try:
-                matslotsmod.place(src, os.path.join(self.out_dir, slot))
-            except OSError as e:
+                dst = os.path.join(self.out_dir, slot)
+                detail = getattr(conn, "cliff_detail", "normal")
+                if what in ("cliff", "x:cliff") and detail != "normal":
+                    # Only a fresh, unheld slot: never edit a shape the renderer uses.
+                    clifflod.place(src, dst, detail)
+                else:
+                    matslotsmod.place(src, dst)
+            except (OSError, cdae.CdaeError) as e:
                 log.debug("pooled shape %s: %s", fname, e)
                 self.matslots.release(owner)
                 continue
@@ -3337,6 +3366,41 @@ class Server:
             self.matslots.release(owner)        # no tile owns it: free again once the mod lets go
             out[what] = [f"{self.vfs_dir}/{slot}", serial]
         return out
+
+    def plain_far_shape(self, conn, ck, info):
+        """A fresh per-player photo-only slot when distant cliffs are disabled.
+
+        The cached authored shape is shared by connections and never mutated.
+        Each off variant keeps the original terrain UVs and obtains its own
+        material/shape slot, released through the normal slotsGone lifecycle.
+        """
+        if conn.distant_cliff_faces:
+            return None
+        src = os.path.splitext(os.path.join(self.out_dir, self.tile_name(*ck)))[0] + "_plain.cdae"
+        if not os.path.exists(src):  # no cliff triangles, or the DAE fallback
+            return None
+        if info.material is None:
+            return {"shape": f"{self.vfs_dir}/{os.path.basename(src)}"}
+        owner = ("plain_far", next(self.slot_serial))
+        name = self.matslots.take(owner)
+        try:
+            with open(src, "rb") as fh:
+                data = fh.read()
+            have = self.matslots.name_in(data)
+            if have is None:
+                raise ValueError("photo-only far tile has no pooled material")
+            data = matslotsmod.restamp(data, have, name)
+            slot = matslotsmod.MatSlots.file(name)
+            dst = os.path.join(self.out_dir, slot)
+            tmp = staging.tmp_for(dst)
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            staging.replace(tmp, dst)
+            serial = next(self.slot_serial)
+            conn.slot_holds[matslotsmod.MatSlots.number(name)] = serial
+            return {"shape": f"{self.vfs_dir}/{slot}", "material": name, "slotSerial": serial}
+        finally:
+            self.matslots.release(owner)
 
     def reslot(self, ck, info):
         """Event loop: a cached tile whose material name went to another tile meanwhile (reclaim_names) is
@@ -3726,6 +3790,8 @@ class Connection:
         # field's detail (lodScale times the layout's K: the distance a level splits at), the tree tiles' reach
         # (treeScale) and the far buildings', skyline's and far bridges' (buildingScale); 1 = the defaults
         self.lod_scale = self.tree_scale = self.building_scale = 1.0
+        self.cliff_detail = "normal"
+        self.distant_cliff_faces = True
         self.view_cap = None                    # the far field's radius at most (m): the mod's fixed view distance
 
     async def map_tiles(self, msg):
@@ -4425,14 +4491,15 @@ class Connection:
 
     def set_graphics(self, msg):
         """The settings page's graphics (the user, 2026-10-28: "give player much more control in the graphics settings
-        (view distance, LOD quality, ETC."), message 'graphics' {lodScale, treeScale, buildingScale, photoPx}, each
+        (view distance, LOD quality, ETC."), message 'graphics' {lodScale, treeScale, buildingScale, photoPx, cliffDetail}, each
         optional (viewM: the fixed view distance in m, the far field's radius at most; 0 = the real horizon):
         lodScale times the K table (the far field's terrain detail: >1 splits each level farther out, finer
         ground to the horizon; Baltimore's first selection, 64 cells: 0.75 -> 0.78x the tiles, 1.3 -> ~1.3x, 2 ->
         2.1x), treeScale the tree tiles' reach (vegetation.SEND_M times it), buildingScale the far buildings', the
         skyline's and the far bridges' (buildings.FAR_SEND_M / SKY_SEND_M / BRIDGE_FAR_SEND_M times it), photoPx the
         ground photo's size (Server.set_base_px). Scales are clamped to GRAPHICS_SCALE; the far field is selected
-        again at once, the trackers send and drop by their new reach at the next pose."""
+        again at once, the trackers send and drop by their new reach at the next pose. Cliff detail applies
+        to new shape slots only; loaded shapes are never mutated."""
         def scale(name, cur):
             v = msg.get(name)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
@@ -4440,6 +4507,12 @@ class Connection:
             return min(GRAPHICS_SCALE[1], max(GRAPHICS_SCALE[0], float(v)))
         lod, tree, bld = (scale("lodScale", self.lod_scale), scale("treeScale", self.tree_scale),
                           scale("buildingScale", self.building_scale))
+        distant_cliffs = msg.get("distantCliffFaces")
+        if isinstance(distant_cliffs, bool):
+            self.distant_cliff_faces = distant_cliffs
+        cliff = msg.get("cliffDetail")
+        if isinstance(cliff, str) and cliff in clifflod.SCALES:
+            self.cliff_detail = cliff
         far = lod != self.lod_scale
         self.lod_scale = lod
         if tree != self.tree_scale:
@@ -5751,7 +5824,8 @@ class Connection:
                 elif isinstance(t, farfield.Piece):
                     m["poly"] = [round(v, 2) for v in t.poly]
                     self.ppolys[t.key] = t.poly
-                if info.shape is not None and info.shape.startswith("slot_"):  # pooled (matslots.py)
+                plain = self.s.plain_far_shape(self, ck, info)
+                if plain is None and info.shape is not None and info.shape.startswith("slot_"):  # pooled (matslots.py)
                     m["slotSerial"] = serial = next(self.s.slot_serial)
                     self.slot_holds[matslotsmod.MatSlots.number(info.material)] = serial
                 if info.material is not None:   # protocol 4: the tile's own imagery material
@@ -5760,6 +5834,8 @@ class Connection:
                     m["detail"] = True          # the shape has UV1 (world-locked detail map)
                     if self.s.layout.format >= 4:   # M1: texture px, the mod's governor unit kind
                         m["tex"] = self.s.tex_size(t.level)
+                if plain is not None:
+                    m.update(plain)
                 self.send(m)
                 if self.batch[1] % 50 == 0:
                     left = sum(1 for g in self.groups for k in g[0] if k not in self.sent)

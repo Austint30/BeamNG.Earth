@@ -85,6 +85,30 @@ class ServerTest(unittest.TestCase):
                                            self.s.texture_name(1, key))
         return ck, name
 
+    def test_photo_only_far_slots_are_isolated_and_released(self):
+        ck,original=self.add('1_0_0')
+        info=self.s.tiles[ck]
+        path=os.path.splitext(os.path.join(self.s.out_dir,self.s.tile_name(*ck)))[0]+'_plain.cdae'
+        source=b'head'+original.encode()+b'tail'
+        with open(path,'wb') as fh: fh.write(source)
+        on,off=Conn(),Conn()
+        on.distant_cliff_faces=True;off.distant_cliff_faces=False
+        self.s.connections.update((on,off))
+        self.assertIsNone(self.s.plain_far_shape(on,ck,info))
+        first=self.s.plain_far_shape(off,ck,info)
+        second=self.s.plain_far_shape(off,ck,info)
+        self.assertNotEqual(first['shape'],second['shape'],'held shapes are never overwritten')
+        self.assertNotEqual(first['material'],original)
+        with open(path,'rb') as fh: self.assertEqual(fh.read(),source)
+        for variant in (first,second):
+            n=matslots.MatSlots.number(variant['material'])
+            self.assertEqual(off.slot_holds[n],variant['slotSerial'])
+            with open(os.path.join(self.s.out_dir,matslots.MatSlots.file(variant['material'])),'rb') as fh:
+                self.assertEqual(fh.read(),source.replace(original.encode(),variant['material'].encode()))
+            del off.slot_holds[n]
+            self.s.slots_let_go([n])
+        self.assertIn(path,self.s.tile_files(self.s.tile_name(*ck)), 'variant pruned with its tile')
+
     def test_idle_tiles_reclaimed_lru_first_and_reslotted(self):
         cks = [self.add(f"0_{i}_0") for i in range(matslots.TARGET + 20)]
         busy = cks[0][0]
@@ -188,6 +212,43 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.s.matslots.stats()["waiting"], 1)      # nobody owns it; the game holds it
         earthd.Connection.slots_gone(c, [[n, serial]])
         self.assertEqual(self.s.matslots.stats()["free"], 1)
+
+    def test_cliff_quality_never_rewrites_a_held_shape_or_shared_source(self):
+        import cdae
+        import clifflod
+        import numpy as np
+        import struct
+        from pathlib import Path
+        p = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+        t = np.array([[0, 1, 2]])
+        coarse = dict(positions=p, tris=t)
+        data = cdae.encode(p, t, material="rock", split_meshes=True,
+                           lods=[(1200, coarse), (600, coarse), (240, coarse)])
+        src = Path(self.s.out_dir)/"cliff.cdae"
+        src.write_bytes(data)
+        c = Conn()
+        c.s = self.s
+        self.s.connections.add(c)
+        held = {}
+        for level in ("low", "extreme", "medium", "high", "normal"):
+            c.cliff_detail = level
+            slots = self.s.pool_shapes(c, {"cliff": src.name, "x:cliff": src.name, "road": src.name})
+            self.assertEqual(len(slots), 3)
+            for what, (path, serial) in slots.items():
+                disk = Path(self.s.out_dir)/path.rsplit("/", 1)[-1]
+                self.assertNotIn(disk, held)
+                actual = disk.read_bytes()
+                if what == "road":
+                    self.assertEqual(actual, data)
+                else:
+                    shape = cdae.decode(actual)
+                    sizes = [v[3] for v in struct.iter_unpack("<3i3fi2i2IfI", shape["details"][2])]
+                    expected = [round(v/clifflod.SCALES[level]) for v in (1200,600,240)]+[2]
+                    self.assertEqual(sizes, expected)
+                held[disk] = actual
+            self.assertEqual(src.read_bytes(), data, "source remains reusable for every connection")
+            for disk, previous in held.items():
+                self.assertEqual(disk.read_bytes(), previous, "previously loaded slot is immutable")
 
     def test_eviction_and_prune_free_names(self):
         ck, name = self.add("0_0_0")
